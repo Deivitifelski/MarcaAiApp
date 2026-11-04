@@ -2,7 +2,7 @@
   "expo": {
     "name": "MeuShow",
     "slug": "APP_MOBILE_MARCA_AI",
-    "version": "2.1.6",
+    "version": "2.1.8",
     "orientation": "portrait",
     "icon": "./assets/images/icone_app_1024.png",
     "scheme": "marcaai",
@@ -21,7 +21,7 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.marcaai.app",
       "appleTeamId": "L5S2D49AB5",
-      "buildNumber": "115",
+      "buildNumber": "117",
       "entitlements": {
         "com.apple.security.application-groups": [
           "group.com.marcaai.app"
@@ -55,7 +55,7 @@
     },
     "android": {
       "package": "com.marcaaipro.app",
-      "versionCode": 61,
+      "versionCode": 63,
       "googleServicesFile": "./android/app/google-services.json",
       "icon": "./assets/images/icone_512x512.png",
       "adaptiveIcon": {

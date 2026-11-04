@@ -248,6 +248,10 @@ export default function AgendaScreen() {
   const lastEventPressAtRef = useRef(0);
   const agendaFocusedRef = useRef(true);
   const eventsAbortRef = useRef<AbortController | null>(null);
+  const convitesDaConsultaRef = useRef(false);
+  const loadedAgendaKeyRef = useRef<string | null>(null);
+  const agendaInFlightKeyRef = useRef<string | null>(null);
+  const agendaDirtyRef = useRef(false);
   const DEBOUNCE_MS = 800;
 
   // Ao entrar na tela Agenda, zerar o badge do ícone do app; ao sair, liberar toque de novo
@@ -459,11 +463,17 @@ export default function AgendaScreen() {
     }
   };
 
-  // Verificar role quando artista mudar (eventos são carregados no efeito mês/ano/artista)
+  // Verificar role quando o artista mudar. Não apaga a lista se for o mesmo artista.
+  const trackedAgendaArtistIdRef = useRef<string | null>(null);
   useEffect(() => {
-    setEvents([]);
+    const nextId = activeArtist?.id ?? null;
+    if (trackedAgendaArtistIdRef.current !== nextId) {
+      trackedAgendaArtistIdRef.current = nextId;
+      setEvents([]);
+      loadedAgendaKeyRef.current = null;
+    }
     checkUserRole();
-  }, [activeArtist]);
+  }, [activeArtist?.id]);
 
   const checkUserRole = async () => {
     if (!activeArtist) {
@@ -518,6 +528,12 @@ export default function AgendaScreen() {
 
   const currentMonth = currentDate.getMonth();
   const currentYear = currentDate.getFullYear();
+  const agendaScopeRef = useRef({ artistId: "", year: 0, month: 0 });
+  agendaScopeRef.current = {
+    artistId: activeArtist?.id || "",
+    year: currentYear,
+    month: currentMonth,
+  };
   const todayFormatted = (() => {
     const d = new Date();
     const s = d.toLocaleDateString("pt-BR", {
@@ -774,6 +790,7 @@ export default function AgendaScreen() {
         setOwnerOriginEventIds(ownerOrigins);
       }
     };
+    if (convitesDaConsultaRef.current) return;
     void loadConviteIdsByEvent();
     return () => {
       cancelled = true;
@@ -847,6 +864,7 @@ export default function AgendaScreen() {
       if (!cancelled) setInvitePartnerByConviteId(nextMap);
     };
 
+    if (convitesDaConsultaRef.current) return;
     void loadInvitePartners();
     return () => {
       cancelled = true;
@@ -882,6 +900,7 @@ export default function AgendaScreen() {
       });
       setCicloStatusByConviteId(next);
     };
+    if (convitesDaConsultaRef.current) return;
     void loadCicloStatus();
     return () => {
       cancelled = true;
@@ -1036,6 +1055,7 @@ export default function AgendaScreen() {
       if (!cancelled) setParticipantAvatarsByEventId(next);
     };
 
+    if (convitesDaConsultaRef.current) return;
     void loadParticipantAvatars();
     return () => {
       cancelled = true;
@@ -1103,9 +1123,10 @@ export default function AgendaScreen() {
 
     const artistId = activeArtist.id;
     const refreshAgenda = () => {
-      if (!agendaFocusedRef.current) return;
       cacheService.invalidateEventsCache(artistId, currentMonth, currentYear);
-      loadEvents(true);
+      agendaDirtyRef.current = true;
+      if (!agendaFocusedRef.current) return;
+      void loadEvents(true);
     };
 
     const channel = supabase
@@ -1139,17 +1160,26 @@ export default function AgendaScreen() {
   useFocusEffect(
     React.useCallback(() => {
       agendaFocusedRef.current = true;
-      if (activeArtist) {
-        void loadEvents(true);
-      } else {
+      const scope = agendaScopeRef.current;
+      const agendaKey = scope.artistId
+        ? `${scope.artistId}|${scope.year}|${scope.month}`
+        : null;
+      if (!scope.artistId) {
         checkIfUserHasArtists();
+      } else if (
+        agendaDirtyRef.current ||
+        loadedAgendaKeyRef.current !== agendaKey
+      ) {
+        void loadEvents(true);
       }
       loadUnreadCount();
       return () => {
         agendaFocusedRef.current = false;
         eventsAbortRef.current?.abort();
       };
-    }, [activeArtist, currentMonth, currentYear]),
+      // Só entra e sai da tela. Troca de mês não pode cancelar a consulta.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []),
   );
 
   // Recarregar artista ativo apenas se a imagem foi atualizada via notificação
@@ -1351,22 +1381,33 @@ export default function AgendaScreen() {
   };
 
   const loadEvents = async (isInitialLoad = true): Promise<boolean> => {
-    if (!activeArtist) {
+    const scope = agendaScopeRef.current;
+    const artistId = scope.artistId;
+    const year = scope.year;
+    const month = scope.month;
+    if (!artistId) {
       setEvents([]);
+      loadedAgendaKeyRef.current = null;
       return true;
     }
     if (!agendaFocusedRef.current) return false;
+
+    const agendaKey = `${artistId}|${year}|${month}`;
+    if (agendaInFlightKeyRef.current === agendaKey) return false;
+    agendaDirtyRef.current = false;
+    agendaInFlightKeyRef.current = agendaKey;
 
     eventsAbortRef.current?.abort();
     const abort = new AbortController();
     eventsAbortRef.current = abort;
 
-    const cacheKeyArtist = activeArtist.id;
+    const cacheKeyArtist = artistId;
+    let reloadAfter = false;
     try {
       const cachedEvents = await cacheService.getEventsData<any[]>(
         cacheKeyArtist,
-        currentYear,
-        currentMonth,
+        year,
+        month,
       );
       if (abort.signal.aborted || !agendaFocusedRef.current) return false;
 
@@ -1379,9 +1420,9 @@ export default function AgendaScreen() {
       }
 
       const result = await getEventsByMonthWithRole(
-        activeArtist.id,
-        currentYear,
-        currentMonth,
+        artistId,
+        year,
+        month,
         abort.signal,
       );
       if (result.aborted || abort.signal.aborted || !agendaFocusedRef.current) return false;
@@ -1391,16 +1432,23 @@ export default function AgendaScreen() {
         setEvents(eventsData);
         setLastUpdate(new Date());
         setIsLoadingMonthEvents(false);
+        loadedAgendaKeyRef.current = agendaKey;
+        convitesDaConsultaRef.current = Boolean(result.collab);
+        if (result.collab) {
+          setParticipantAvatarsByEventId(result.collab.participantes);
+          setInvitePartnerByConviteId(result.collab.parceiros);
+          setCicloStatusByConviteId(result.collab.ciclos);
+          setConviteIdByEventId(result.collab.conviteIdByEventId);
+          setOwnerOriginEventIds(result.collab.ownerOriginEventIds);
+        }
         await cacheService.setEventsData(
-          activeArtist.id,
-          currentYear,
-          currentMonth,
+          artistId,
+          year,
+          month,
           eventsData,
         );
-        return true;
-      }
-
-      if (
+        reloadAfter = agendaDirtyRef.current;
+      } else if (
         maybeShowConnectionError(null, result.error, {
           onRetry: () => void retryAgendaConnection(),
         })
@@ -1411,22 +1459,22 @@ export default function AgendaScreen() {
           setEvents([]);
         }
         return false;
-      }
+      } else {
+        const isAccessDenied =
+          result.errorCode === "P0001" ||
+          (result.error &&
+            (result.error.includes("Usuário não tem acesso a este artista") ||
+              result.error.includes("não tem acesso")));
 
-      const isAccessDenied =
-        result.errorCode === "P0001" ||
-        (result.error &&
-          (result.error.includes("Usuário não tem acesso a este artista") ||
-            result.error.includes("não tem acesso")));
+        if (isAccessDenied) {
+          await handleUserRemovedFromArtist();
+          return true;
+        }
 
-      if (isAccessDenied) {
-        await handleUserRemovedFromArtist();
+        setEvents([]);
+        setIsLoadingMonthEvents(false);
         return true;
       }
-
-      setEvents([]);
-      setIsLoadingMonthEvents(false);
-      return true;
     } catch (error: any) {
       if (
         maybeShowConnectionError(error, undefined, {
@@ -1435,8 +1483,8 @@ export default function AgendaScreen() {
       ) {
         const cachedEvents = await cacheService.getEventsData<any[]>(
           cacheKeyArtist,
-          currentYear,
-          currentMonth,
+          year,
+          month,
         );
         if (cachedEvents) {
           setEvents(cachedEvents);
@@ -1460,7 +1508,13 @@ export default function AgendaScreen() {
       setEvents([]);
       setIsLoadingMonthEvents(false);
       return true;
+    } finally {
+      if (agendaInFlightKeyRef.current === agendaKey) {
+        agendaInFlightKeyRef.current = null;
+      }
     }
+    if (reloadAfter) return loadEvents(true);
+    return true;
   };
 
   const retryAgendaConnection = async () => {

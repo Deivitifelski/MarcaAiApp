@@ -3,7 +3,11 @@ import { isEventDateAlreadyPast, toCalendarYmd } from "../../lib/dateUtils";
 import { supabase } from "../../lib/supabase";
 import { cacheService } from "../cacheService";
 import { eventoEhCopiaDoConvidado } from "./conviteParticipacaoEventoService";
-import { getUserPermissions, hasPermission } from "./permissionsService";
+import {
+  getUserPermissions,
+  hasPermission,
+  normalizeArtistMemberRole,
+} from "./permissionsService";
 
 const SUPABASE_URL = "https://ctulmpyaikxsnjqmrzxf.supabase.co";
 const SUPABASE_ANON_KEY =
@@ -1196,7 +1200,133 @@ export const getEventsByArtistWithRole = async (
   }
 };
 
-// Buscar eventos de um mês específico com filtragem por role
+function isAgendaRpcMissing(message?: string | null): boolean {
+  if (!message) return false;
+  const text = message.toLowerCase();
+  return (
+    text.includes("could not find the function") ||
+    text.includes("schema cache") ||
+    (text.includes("function") && text.includes("does not exist"))
+  );
+}
+
+export interface AgendaConvidado {
+  id: string;
+  name: string;
+  profile_url: string | null;
+  isHost: boolean;
+}
+
+export interface AgendaMesCollab {
+  participantes: Record<string, AgendaConvidado[]>;
+  parceiros: Record<string, { name: string; profile_url: string | null }>;
+  ciclos: Record<string, string>;
+  conviteIdByEventId: Record<string, string>;
+  ownerOriginEventIds: Record<string, true>;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function mapAgendaMesPayload(payload: unknown): {
+  events: EventWithRole[];
+  collab: AgendaMesCollab | null;
+} {
+  const body = asRecord(payload);
+  const role = normalizeArtistMemberRole(String(body.role || ""));
+  const rows = Array.isArray(body.events) ? body.events : [];
+  const events = excludeFeedMarketplaceEvents(
+    rows.map((row) => {
+      const event = row as EventWithRole;
+      const rawValue = event.value as unknown;
+      const value =
+        rawValue == null || rawValue === ""
+          ? null
+          : Number.isFinite(Number(rawValue))
+            ? Number(rawValue)
+            : null;
+      return {
+        ...event,
+        event_date: toCalendarYmd(event.event_date) || String(event.event_date || ""),
+        value,
+        user_role: role,
+      };
+    }),
+  );
+
+  if (body.convidados_inclusos !== true) {
+    return { events, collab: null };
+  }
+
+  const participantes: AgendaMesCollab["participantes"] = {};
+  Object.entries(asRecord(body.participantes)).forEach(([eventId, list]) => {
+    if (!Array.isArray(list)) return;
+    participantes[eventId] = list
+      .map((item) => {
+        const row = asRecord(item);
+        const id = String(row.id || "");
+        if (!id) return null;
+        return {
+          id,
+          name: String(row.name || "Artista"),
+          profile_url:
+            row.profile_url != null && String(row.profile_url).trim()
+              ? String(row.profile_url)
+              : null,
+          isHost: row.isHost === true,
+        };
+      })
+      .filter((item): item is AgendaConvidado => item != null);
+  });
+
+  const parceiros: AgendaMesCollab["parceiros"] = {};
+  Object.entries(asRecord(body.parceiros)).forEach(([conviteId, item]) => {
+    const row = asRecord(item);
+    parceiros[conviteId] = {
+      name: String(row.name || "Artista"),
+      profile_url:
+        row.profile_url != null && String(row.profile_url).trim()
+          ? String(row.profile_url)
+          : null,
+    };
+  });
+
+  const ciclos: Record<string, string> = {};
+  Object.entries(asRecord(body.ciclos)).forEach(([conviteId, status]) => {
+    if (status != null && String(status).trim()) ciclos[conviteId] = String(status);
+  });
+
+  const conviteIdByEventId: Record<string, string> = {};
+  Object.entries(asRecord(body.copias)).forEach(([eventId, conviteId]) => {
+    if (conviteId != null && String(conviteId).trim()) {
+      conviteIdByEventId[eventId] = String(conviteId);
+    }
+  });
+
+  const ownerOriginEventIds: Record<string, true> = {};
+  if (Array.isArray(body.origens_do_dono)) {
+    body.origens_do_dono.forEach((id) => {
+      if (id != null && String(id).trim()) ownerOriginEventIds[String(id)] = true;
+    });
+  }
+
+  return {
+    events,
+    collab: {
+      participantes,
+      parceiros,
+      ciclos,
+      conviteIdByEventId,
+      ownerOriginEventIds,
+    },
+  };
+}
+
+// Buscar eventos de um mês específico com filtragem por role.
+// Uma função no banco devolve papel e eventos. Se ela ainda não existir, usa as consultas antigas.
 export const getEventsByMonthWithRole = async (
   artistId: string,
   year: number,
@@ -1206,11 +1336,42 @@ export const getEventsByMonthWithRole = async (
   success: boolean;
   error: string | null;
   events?: EventWithRole[];
+  collab?: AgendaMesCollab | null;
   errorCode?: string;
   aborted?: boolean;
 }> => {
   try {
     const { startDate, endDate } = calendarMonthBounds(year, month);
+
+    let rpc = supabase.rpc("rpc_app_agenda_mes", {
+      p_artista_id: artistId,
+      p_inicio: startDate,
+      p_fim: endDate,
+    });
+    if (abortSignal) rpc = rpc.abortSignal(abortSignal);
+    const rpcRes = await rpc;
+    if (abortSignal?.aborted || isAbortError(rpcRes.error)) {
+      return { success: false, error: null, aborted: true };
+    }
+    if (!rpcRes.error) {
+      const mapped = mapAgendaMesPayload(rpcRes.data);
+      return {
+        success: true,
+        error: null,
+        events: mapped.events,
+        collab: mapped.collab,
+      };
+    }
+    if (!isAgendaRpcMissing(rpcRes.error.message)) {
+      const denied =
+        rpcRes.error.code === "P0001" ||
+        (rpcRes.error.message || "").includes("não tem acesso");
+      return {
+        success: false,
+        error: rpcRes.error.message,
+        errorCode: denied ? "P0001" : rpcRes.error.code || undefined,
+      };
+    }
 
     const { data: userRes, error: userError } = await supabase.auth.getUser();
     if (userError || !userRes.user) {
